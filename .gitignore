@@ -1,0 +1,26 @@
+# Go
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Node / Frontend
+node_modules/
+dist/
+.parcel-cache/
+.vite/
+coverage/
+
+# IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Misc
+*.log
+*.local
+*.env
+.env*
