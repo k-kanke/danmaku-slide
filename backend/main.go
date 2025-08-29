@@ -5,6 +5,7 @@ import (
     "encoding/base64"
     "encoding/json"
     "fmt"
+    "io"
     "log"
     "net/http"
     "os"
@@ -13,28 +14,51 @@ import (
 
     qrcode "github.com/skip2/go-qrcode"
     "github.com/gorilla/websocket"
+    "sync"
 )
 
 type room struct {
-    ID string
+    ID       string
+    Hub      *Hub
+    Paused   bool
+    SlowMode time.Duration
 }
 
 type server struct {
     mux   *http.ServeMux
     rooms map[string]*room
+    mu    sync.Mutex
+    // rate[roomID][identity] = lastPostTime
+    rate map[string]map[string]time.Time
+    // NG words (lowercased)
+    ngWords []string
 }
 
 func newServer() *server {
     s := &server{
         mux:   http.NewServeMux(),
         rooms: make(map[string]*room),
+        rate:  make(map[string]map[string]time.Time),
     }
 
     // Routes
     s.mux.HandleFunc("/health", s.handleHealth)
     s.mux.HandleFunc("/rooms", s.handleCreateRoom)
     s.mux.HandleFunc("/ws/", s.handleWS)
+    s.mux.HandleFunc("/rooms/", s.handleRoomSubroutes)
 
+    // Load NG words from env (comma-separated), fallback to a small default
+    if v := strings.TrimSpace(os.Getenv("NG_WORDS")); v != "" {
+        parts := strings.Split(v, ",")
+        for _, p := range parts {
+            p = strings.ToLower(strings.TrimSpace(p))
+            if p != "" {
+                s.ngWords = append(s.ngWords, p)
+            }
+        }
+    } else {
+        s.ngWords = []string{"死ね", "fuck", "shit"}
+    }
     return s
 }
 
@@ -54,7 +78,9 @@ func (s *server) handleCreateRoom(w http.ResponseWriter, r *http.Request) {
     id := newRoomID(10)
     h := newHub()
     go h.run()
+    s.mu.Lock()
     s.rooms[id] = &room{ID: id, Hub: h}
+    s.mu.Unlock()
 
     base := baseURL(r)
     overlayURL := fmt.Sprintf("%s/overlay/%s", base, id)
@@ -86,7 +112,9 @@ func (s *server) handleWS(w http.ResponseWriter, r *http.Request) {
         return
     }
     roomID := strings.TrimPrefix(r.URL.Path, "/ws/")
+    s.mu.Lock()
     rm, ok := s.rooms[roomID]
+    s.mu.Unlock()
     if !ok {
         http.Error(w, "room not found", http.StatusNotFound)
         return
@@ -109,6 +137,109 @@ func (s *server) handleWS(w http.ResponseWriter, r *http.Request) {
 
     go client.writePump()
     go client.readPump()
+}
+
+// Handle room subroutes like /rooms/:roomId/messages
+func (s *server) handleRoomSubroutes(w http.ResponseWriter, r *http.Request) {
+    // Expect /rooms/{id}/...
+    rest := strings.TrimPrefix(r.URL.Path, "/rooms/")
+    parts := strings.Split(rest, "/")
+    if len(parts) < 2 {
+        http.NotFound(w, r)
+        return
+    }
+    roomID, tail := parts[0], parts[1]
+    s.mu.Lock()
+    rm, ok := s.rooms[roomID]
+    s.mu.Unlock()
+    if !ok {
+        http.Error(w, "room not found", http.StatusNotFound)
+        return
+    }
+
+    switch tail {
+    case "messages":
+        if r.Method != http.MethodPost {
+            http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+            return
+        }
+        s.handlePostMessage(w, r, rm, roomID)
+        return
+    default:
+        http.NotFound(w, r)
+        return
+    }
+}
+
+type postMessageReq struct {
+    Text   string `json:"text"`
+    Handle string `json:"handle"`
+}
+
+func (s *server) handlePostMessage(w http.ResponseWriter, r *http.Request, rm *room, roomID string) {
+    body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20)) // 4MB cap
+    if err != nil {
+        http.Error(w, "invalid body", http.StatusBadRequest)
+        return
+    }
+    var req postMessageReq
+    if err := json.Unmarshal(body, &req); err != nil {
+        http.Error(w, "invalid json", http.StatusBadRequest)
+        return
+    }
+    req.Text = strings.TrimSpace(req.Text)
+    req.Handle = strings.TrimSpace(req.Handle)
+    if req.Text == "" {
+        http.Error(w, "text required", http.StatusBadRequest)
+        return
+    }
+    if len([]rune(req.Text)) > 200 {
+        http.Error(w, "text too long", http.StatusBadRequest)
+        return
+    }
+    if len([]rune(req.Handle)) > 32 {
+        http.Error(w, "handle too long", http.StatusBadRequest)
+        return
+    }
+
+    // NG word check
+    lower := strings.ToLower(req.Text)
+    for _, ng := range s.ngWords {
+        if ng == "" { continue }
+        if strings.Contains(lower, strings.ToLower(ng)) {
+            http.Error(w, "ng word detected", http.StatusForbidden)
+            return
+        }
+    }
+
+    // Rate limit: 1 post per 2s per identity per room
+    identity := clientIdentity(r, req.Handle)
+    now := time.Now()
+    s.mu.Lock()
+    if s.rate[roomID] == nil {
+        s.rate[roomID] = make(map[string]time.Time)
+    }
+    last := s.rate[roomID][identity]
+    if now.Sub(last) < 2*time.Second {
+        s.mu.Unlock()
+        http.Error(w, "rate limited", http.StatusTooManyRequests)
+        return
+    }
+    s.rate[roomID][identity] = now
+    s.mu.Unlock()
+
+    // Broadcast payload
+    payload := map[string]string{
+        "type":   "chat",
+        "text":   req.Text,
+        "handle": req.Handle,
+    }
+    b, _ := json.Marshal(payload)
+    rm.Hub.broadcast <- b
+
+    w.Header().Set("Content-Type", "application/json; charset=utf-8")
+    w.WriteHeader(http.StatusAccepted)
+    json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
 
 func main() {
@@ -169,6 +300,24 @@ func baseURL(r *http.Request) string {
     }
     // Trim possible trailing slash
     return strings.TrimRight(fmt.Sprintf("%s://%s", scheme, host), "/")
+}
+
+func clientIdentity(r *http.Request, handle string) string {
+    ip := r.Header.Get("X-Forwarded-For")
+    if ip == "" {
+        ip = r.RemoteAddr
+    } else {
+        // XFF may contain multiple IPs, take the first
+        if i := strings.Index(ip, ","); i >= 0 {
+            ip = ip[:i]
+        }
+    }
+    // strip port if present
+    if i := strings.LastIndex(ip, ":"); i > -1 {
+        ip = ip[:i]
+    }
+    handle = strings.ToLower(strings.TrimSpace(handle))
+    return ip + "|" + handle
 }
 
 // --- WebSocket Hub ---
