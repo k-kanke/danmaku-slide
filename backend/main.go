@@ -46,6 +46,7 @@ func newServer() *server {
     s.mux.HandleFunc("/rooms", s.handleCreateRoom)
     s.mux.HandleFunc("/ws/", s.handleWS)
     s.mux.HandleFunc("/overlay/", s.handleOverlay)
+    s.mux.HandleFunc("/post/", s.handlePostForm)
     s.mux.HandleFunc("/rooms/", s.handleRoomSubroutes)
 
     // Load NG words from env (comma-separated), fallback to a small default
@@ -287,6 +288,103 @@ func (s *server) handleOverlay(w http.ResponseWriter, r *http.Request) {
   </script>
 </body>
 </html>`, roomID, roomID)
+}
+
+// GET /post/:roomId -> simple HTML form to submit messages
+func (s *server) handlePostForm(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+    roomID := strings.TrimPrefix(r.URL.Path, "/post/")
+    s.mu.Lock()
+    _, ok := s.rooms[roomID]
+    s.mu.Unlock()
+    if !ok {
+        http.Error(w, "room not found", http.StatusNotFound)
+        return
+    }
+    w.Header().Set("Content-Type", "text/html; charset=utf-8")
+    fmt.Fprintf(w, `<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SlideFlow Post - %s</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans JP', 'Hiragino Kaku Gothic ProN', Meiryo, Arial, sans-serif; margin: 24px; }
+    .wrap { max-width: 640px; margin: 0 auto; }
+    label { display:block; margin: 12px 0 6px; font-weight: 600; }
+    input, textarea, button { width:100%%; font-size:16px; padding:10px; box-sizing:border-box; }
+    textarea { height: 120px; resize: vertical; }
+    .row { display:flex; gap:12px; align-items:center; }
+    .row > * { flex: 1; }
+    .hint { color: #888; font-size: 12px; }
+    .status { margin-top: 12px; min-height: 1.4em; }
+    button { cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>コメント投稿</h1>
+    <p class="hint">ルームID: <code>%s</code></p>
+    <form id="msgForm">
+      <label for="handle">ハンドルネーム（任意・32文字まで）</label>
+      <input id="handle" name="handle" maxlength="32" placeholder="例: alice" />
+
+      <label for="text">コメント（必須・200文字まで）</label>
+      <textarea id="text" name="text" maxlength="200" placeholder="今のスライドに一言！"></textarea>
+      <div class="row">
+        <div class="hint" id="counter">0 / 200</div>
+        <div class="hint">送信後、すぐにスクリーンへ流れます。</div>
+      </div>
+      <button id="submitBtn" type="submit">送信</button>
+      <div class="status" id="status"></div>
+    </form>
+  </div>
+  <script>
+  (function(){
+    const roomId = %q;
+    const form = document.getElementById('msgForm');
+    const handle = document.getElementById('handle');
+    const text = document.getElementById('text');
+    const counter = document.getElementById('counter');
+    const status = document.getElementById('status');
+    const submitBtn = document.getElementById('submitBtn');
+
+    function updateCounter(){ counter.textContent = (text.value||'').length + ' / 200'; }
+    text.addEventListener('input', updateCounter); updateCounter();
+
+    form.addEventListener('submit', async (e)=>{
+      e.preventDefault();
+      const payload = { text: text.value.trim(), handle: handle.value.trim() };
+      if (!payload.text){ status.textContent = 'コメントを入力してください'; return; }
+      submitBtn.disabled = true; status.textContent = '送信中...';
+      try {
+        const res = await fetch('/rooms/' + roomId + '/messages', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        if (!res.ok){
+          const t = await res.text();
+          if (res.status === 429) status.textContent = '連投はできません（2秒間隔）';
+          else if (res.status === 403) status.textContent = 'NGワードが含まれています';
+          else status.textContent = 'エラー: ' + t;
+        } else {
+          status.textContent = '送信しました！';
+          text.value = ''; updateCounter();
+        }
+      } catch(err){
+        status.textContent = '通信エラー: ' + err;
+      } finally {
+        submitBtn.disabled = false;
+      }
+    });
+  })();
+  </script>
+</body>
+</html>`, roomID, roomID, roomID)
 }
 
 // Handle room subroutes like /rooms/:roomId/messages
