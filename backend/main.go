@@ -12,6 +12,7 @@ import (
     "time"
 
     qrcode "github.com/skip2/go-qrcode"
+    "github.com/gorilla/websocket"
 )
 
 type room struct {
@@ -32,6 +33,7 @@ func newServer() *server {
     // Routes
     s.mux.HandleFunc("/health", s.handleHealth)
     s.mux.HandleFunc("/rooms", s.handleCreateRoom)
+    s.mux.HandleFunc("/ws/", s.handleWS)
 
     return s
 }
@@ -50,7 +52,9 @@ func (s *server) handleCreateRoom(w http.ResponseWriter, r *http.Request) {
     }
 
     id := newRoomID(10)
-    s.rooms[id] = &room{ID: id}
+    h := newHub()
+    go h.run()
+    s.rooms[id] = &room{ID: id, Hub: h}
 
     base := baseURL(r)
     overlayURL := fmt.Sprintf("%s/overlay/%s", base, id)
@@ -73,6 +77,38 @@ func (s *server) handleCreateRoom(w http.ResponseWriter, r *http.Request) {
 
     w.Header().Set("Content-Type", "application/json; charset=utf-8")
     json.NewEncoder(w).Encode(resp)
+}
+
+// GET /ws/:roomId
+func (s *server) handleWS(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+    roomID := strings.TrimPrefix(r.URL.Path, "/ws/")
+    rm, ok := s.rooms[roomID]
+    if !ok {
+        http.Error(w, "room not found", http.StatusNotFound)
+        return
+    }
+
+    upgrader := websocket.Upgrader{
+        ReadBufferSize:  1024,
+        WriteBufferSize: 1024,
+        CheckOrigin: func(r *http.Request) bool { return true },
+    }
+
+    conn, err := upgrader.Upgrade(w, r, nil)
+    if err != nil {
+        log.Printf("ws upgrade error: %v", err)
+        return
+    }
+
+    client := &Client{hub: rm.Hub, conn: conn, send: make(chan []byte, 256)}
+    rm.Hub.register <- client
+
+    go client.writePump()
+    go client.readPump()
 }
 
 func main() {
@@ -133,4 +169,99 @@ func baseURL(r *http.Request) string {
     }
     // Trim possible trailing slash
     return strings.TrimRight(fmt.Sprintf("%s://%s", scheme, host), "/")
+}
+
+// --- WebSocket Hub ---
+
+type Hub struct {
+    clients    map[*Client]bool
+    broadcast  chan []byte
+    register   chan *Client
+    unregister chan *Client
+}
+
+func newHub() *Hub {
+    return &Hub{
+        clients:    make(map[*Client]bool),
+        broadcast:  make(chan []byte, 256),
+        register:   make(chan *Client),
+        unregister: make(chan *Client),
+    }
+}
+
+func (h *Hub) run() {
+    for {
+        select {
+        case c := <-h.register:
+            h.clients[c] = true
+        case c := <-h.unregister:
+            if _, ok := h.clients[c]; ok {
+                delete(h.clients, c)
+                close(c.send)
+            }
+        case msg := <-h.broadcast:
+            for c := range h.clients {
+                select {
+                case c.send <- msg:
+                default:
+                    close(c.send)
+                    delete(h.clients, c)
+                }
+            }
+        }
+    }
+}
+
+type Client struct {
+    hub  *Hub
+    conn *websocket.Conn
+    send chan []byte
+}
+
+func (c *Client) readPump() {
+    defer func() {
+        c.hub.unregister <- c
+        c.conn.Close()
+    }()
+    c.conn.SetReadLimit(1024)
+    c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+    c.conn.SetPongHandler(func(string) error {
+        c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+        return nil
+    })
+    for {
+        _, message, err := c.conn.ReadMessage()
+        if err != nil {
+            break
+        }
+        // Relay any client message to the hub.
+        c.hub.broadcast <- message
+    }
+}
+
+func (c *Client) writePump() {
+    ticker := time.NewTicker(50 * time.Second)
+    defer func() {
+        ticker.Stop()
+        c.conn.Close()
+    }()
+    for {
+        select {
+        case message, ok := <-c.send:
+            c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+            if !ok {
+                // Hub closed the channel.
+                c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+                return
+            }
+            if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+                return
+            }
+        case <-ticker.C:
+            c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+            if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+                return
+            }
+        }
+    }
 }
