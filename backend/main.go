@@ -47,6 +47,7 @@ func newServer() *server {
     s.mux.HandleFunc("/ws/", s.handleWS)
     s.mux.HandleFunc("/overlay/", s.handleOverlay)
     s.mux.HandleFunc("/post/", s.handlePostForm)
+    s.mux.HandleFunc("/admin/", s.handleAdmin)
     s.mux.HandleFunc("/rooms/", s.handleRoomSubroutes)
 
     // Load NG words from env (comma-separated), fallback to a small default
@@ -368,7 +369,8 @@ func (s *server) handlePostForm(w http.ResponseWriter, r *http.Request) {
         });
         if (!res.ok){
           const t = await res.text();
-          if (res.status === 429) status.textContent = '連投はできません（2秒間隔）';
+          if (res.status === 429) status.textContent = '連投はできません（クールダウン中）';
+          else if (res.status === 423) status.textContent = '現在一時停止中です';
           else if (res.status === 403) status.textContent = 'NGワードが含まれています';
           else status.textContent = 'エラー: ' + t;
         } else {
@@ -385,6 +387,100 @@ func (s *server) handlePostForm(w http.ResponseWriter, r *http.Request) {
   </script>
 </body>
 </html>`, roomID, roomID, roomID)
+}
+
+// GET /admin/:roomId -> simple admin controls
+func (s *server) handleAdmin(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+    roomID := strings.TrimPrefix(r.URL.Path, "/admin/")
+    s.mu.Lock()
+    rm, ok := s.rooms[roomID]
+    s.mu.Unlock()
+    if !ok {
+        http.Error(w, "room not found", http.StatusNotFound)
+        return
+    }
+    paused := rm.Paused
+    slowMs := int(rm.SlowMode / time.Millisecond)
+    w.Header().Set("Content-Type", "text/html; charset=utf-8")
+    fmt.Fprintf(w, `<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SlideFlow Admin - %s</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans JP', 'Hiragino Kaku Gothic ProN', Meiryo, Arial, sans-serif; margin: 24px; }
+    .wrap { max-width: 640px; margin: 0 auto; }
+    h1 { margin-bottom: 4px; }
+    .hint { color: #888; font-size: 12px; margin-bottom: 16px; }
+    label { display:block; margin: 12px 0 6px; font-weight: 600; }
+    input, button { font-size:16px; padding:10px; }
+    .row { display:flex; gap:12px; align-items:center; }
+    .status { margin-top: 12px; min-height: 1.4em; }
+    button { cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>管理パネル</h1>
+    <p class="hint">ルームID: <code>%s</code></p>
+    <div class="row">
+      <button id="pauseBtn">一時停止</button>
+      <button id="resumeBtn">再開</button>
+      <button id="clearBtn">全消去</button>
+    </div>
+    <label for="slow">スローモード（ミリ秒）</label>
+    <div class="row">
+      <input id="slow" type="number" min="0" step="100" value="%d" />
+      <button id="applySlow">適用</button>
+    </div>
+    <div class="status" id="status"></div>
+  </div>
+  <script>
+  (function(){
+    const roomId = %q;
+    const status = document.getElementById('status');
+    const pauseBtn = document.getElementById('pauseBtn');
+    const resumeBtn = document.getElementById('resumeBtn');
+    const clearBtn = document.getElementById('clearBtn');
+    const slow = document.getElementById('slow');
+    const applySlow = document.getElementById('applySlow');
+    let paused = %t;
+
+    function setStatus(t){ status.textContent = t; }
+    function post(path, body){
+      return fetch('/rooms/' + roomId + '/' + path, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: body ? JSON.stringify(body) : null
+      });
+    }
+
+    pauseBtn.addEventListener('click', async ()=>{
+      const res = await post('pause');
+      if (res.ok){ paused = true; setStatus('一時停止しました'); } else setStatus('エラー: ' + await res.text());
+    });
+    resumeBtn.addEventListener('click', async ()=>{
+      const res = await post('resume');
+      if (res.ok){ paused = false; setStatus('再開しました'); } else setStatus('エラー: ' + await res.text());
+    });
+    clearBtn.addEventListener('click', async ()=>{
+      const res = await post('clear');
+      if (res.ok){ setStatus('全消去を送信しました'); } else setStatus('エラー: ' + await res.text());
+    });
+    applySlow.addEventListener('click', async ()=>{
+      const ms = parseInt(slow.value||'0', 10) || 0;
+      const res = await post('slowmode', {ms});
+      if (res.ok){ setStatus('スローモード: ' + ms + 'ms'); } else setStatus('エラー: ' + await res.text());
+    });
+  })();
+  </script>
+</body>
+</html>`, roomID, roomID, slowMs, roomID, paused)
 }
 
 // Handle room subroutes like /rooms/:roomId/messages
@@ -412,6 +508,33 @@ func (s *server) handleRoomSubroutes(w http.ResponseWriter, r *http.Request) {
             return
         }
         s.handlePostMessage(w, r, rm, roomID)
+        return
+    case "pause":
+        if r.Method != http.MethodPost { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }
+        s.mu.Lock(); rm.Paused = true; s.mu.Unlock()
+        w.Header().Set("Content-Type", "application/json; charset=utf-8")
+        json.NewEncoder(w).Encode(map[string]any{"ok": true, "paused": true})
+        return
+    case "resume":
+        if r.Method != http.MethodPost { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }
+        s.mu.Lock(); rm.Paused = false; s.mu.Unlock()
+        w.Header().Set("Content-Type", "application/json; charset=utf-8")
+        json.NewEncoder(w).Encode(map[string]any{"ok": true, "paused": false})
+        return
+    case "clear":
+        if r.Method != http.MethodPost { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }
+        rm.Hub.broadcast <- []byte(`{"type":"clear"}`)
+        w.Header().Set("Content-Type", "application/json; charset=utf-8")
+        json.NewEncoder(w).Encode(map[string]any{"ok": true})
+        return
+    case "slowmode":
+        if r.Method != http.MethodPost { http.Error(w, "method not allowed", http.StatusMethodNotAllowed); return }
+        var body struct{ Ms int `json:"ms"` }
+        if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil { http.Error(w, "invalid json", http.StatusBadRequest); return }
+        if body.Ms < 0 { body.Ms = 0 }
+        s.mu.Lock(); rm.SlowMode = time.Duration(body.Ms) * time.Millisecond; s.mu.Unlock()
+        w.Header().Set("Content-Type", "application/json; charset=utf-8")
+        json.NewEncoder(w).Encode(map[string]any{"ok": true, "slowModeMs": body.Ms})
         return
     default:
         http.NotFound(w, r)
@@ -460,7 +583,20 @@ func (s *server) handlePostMessage(w http.ResponseWriter, r *http.Request, rm *r
         }
     }
 
-    // Rate limit: 1 post per 2s per identity per room
+    // Check paused and apply slow mode as cooldown
+    s.mu.Lock()
+    paused := rm.Paused
+    slow := rm.SlowMode
+    s.mu.Unlock()
+    if paused {
+        http.Error(w, "paused", http.StatusLocked)
+        return
+    }
+
+    cooldown := 2 * time.Second
+    if slow > 0 {
+        cooldown = slow
+    }
     identity := clientIdentity(r, req.Handle)
     now := time.Now()
     s.mu.Lock()
@@ -468,7 +604,7 @@ func (s *server) handlePostMessage(w http.ResponseWriter, r *http.Request, rm *r
         s.rate[roomID] = make(map[string]time.Time)
     }
     last := s.rate[roomID][identity]
-    if now.Sub(last) < 2*time.Second {
+    if now.Sub(last) < cooldown {
         s.mu.Unlock()
         http.Error(w, "rate limited", http.StatusTooManyRequests)
         return
