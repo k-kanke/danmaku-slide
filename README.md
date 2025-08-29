@@ -30,4 +30,27 @@ SlideFlow (仮)
 
 ---
 
-このコミットでは最小のディレクトリ構成と `/health` のみ実装しています。
+セットアップ済みの主なエンドポイント
+- `POST /rooms` ルーム作成（`roomId`, `overlayUrl`, `postUrl`, `qrPngBase64`）
+- `GET /ws/:roomId` WebSocket（ルーム単位のHub）
+- `POST /rooms/:roomId/messages` 投稿（レート制限/NGワード/スローモード/一時停止）
+- `GET /overlay/:roomId` 透明Canvasオーバーレイ
+- `GET /post/:roomId` 参加者用フォーム
+- `GET /admin/:roomId` 管理パネル（Pause/Resume/Clear/SlowMode）
+
+ローカル起動
+```
+cd backend
+go run .
+```
+
+Docker ビルド/起動
+```
+docker build -t slideflow .
+docker run --rm -p 8080:8080 -e PORT=8080 slideflow
+```
+
+NGワードの上書き
+```
+export NG_WORDS="word1,word2,死ね"
+```
