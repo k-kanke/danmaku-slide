@@ -30,6 +30,20 @@ danmaku-slide
 
 ---
 
+クイックスタート（発表者向け・おすすめ）
+- `cd backend && go run .` を起動
+- ブラウザで `http://localhost:8080/present` を開く
+- 画面下のバーで資料ファイルを選択
+  - ファイル選択: PNG/JPGを複数同時選択可、PDF（単一）も可
+  - フォルダ選択: 画像フォルダを丸ごと選択可（サブパス順／自然順で並びます）
+  - `F` で全画面、`H` でオーバーレイ表示/非表示、`←/→` で前後スライド
+- 右下「QR表示」から参加者に投稿ページを共有できます（同時に `投稿ページを開く` も可）
+
+備考（ファイル形式）
+- 画像: PNG/JPG を複数可。`←/→` でページ送り。
+- PDF: 単一ファイルに対応（埋め込みビューアで表示）。ページ操作はPDFビューア側のUIまたは `PageUp/PageDown/矢印キー` を使用してください。
+- PPTXなど: いったんPDFに書き出して利用してください（ネイティブ対応は検討中）。
+
 セットアップ済みの主なエンドポイント
 - `POST /rooms` ルーム作成（`roomId`, `overlayUrl`, `postUrl`, `qrPngBase64`）
 - `GET /ws/:roomId` WebSocket（ルーム単位のHub）
@@ -37,6 +51,7 @@ danmaku-slide
 - `GET /overlay/:roomId` 透明Canvasオーバーレイ
 - `GET /post/:roomId` 参加者用フォーム
 - `GET /admin/:roomId` 管理パネル（Pause/Resume/Clear/SlowMode）
+- `GET /present` 発表者UI（画像スライド選択 + オーバーレイ）
 
 ローカル起動
 ```
